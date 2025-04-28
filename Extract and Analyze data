@@ -1,0 +1,228 @@
+import requests
+import pandas as pd
+import psycopg2
+from psycopg2 import Error
+import matplotlib.pyplot as plt
+from datetime import datetime
+import json
+import os
+import uuid
+
+# Configuration
+API_URL = "https://api.beba.example.com/v1/customer_data"  # Replace with actual API endpoint
+API_KEY = "your_api_key_here"  # Replace with actual API key
+DB_CONFIG = {
+    "dbname": "beba_db",
+    "user": "postgres",
+    "password": "your_password",
+    "host": "localhost",
+    "port": "5432"
+}
+OUTPUT_DIR = "analytics_output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Function to extract data from API
+def extract_data_from_api():
+    try:
+        headers = {"Authorization": f"Bearer {API_KEY}"}
+        response = requests.get(API_URL, headers=headers)
+        response.raise_for_status()  # Raise exception for bad status codes
+        data = response.json()
+        return data.get("customers", [])
+    except requests.RequestException as e:
+        print(f"Error fetching data from API: {e}")
+        return []
+
+# Function to connect to PostgreSQL and store data
+def store_data_in_db(data):
+    try:
+        connection = psycopg2.connect(**DB_CONFIG)
+        cursor = connection.cursor()
+        
+        # Create table if not exists
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS customer_data (
+            user_id VARCHAR(50) PRIMARY KEY,
+            name VARCHAR(100),
+            email VARCHAR(100),
+            ride_count INTEGER,
+            total_spent FLOAT,
+            last_ride TIMESTAMP,
+            pickup_locations JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        cursor.execute(create_table_query)
+        
+        # Insert or update data
+        for customer in data:
+            user_id = str(customer.get("user_id", uuid.uuid4()))
+            pickup_locations = json.dumps(customer.get("pickup_locations", []))
+            insert_query = """
+            INSERT INTO customer_data (user_id, name, email, ride_count, total_spent, last_ride, pickup_locations)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET name = EXCLUDED.name,
+                email = EXCLUDED.email,
+                ride_count = EXCLUDED.ride_count,
+                total_spent = EXCLUDED.total_spent,
+                last_ride = EXCLUDED.last_ride,
+                pickup_locations = EXCLUDED.pickup_locations;
+            """
+            cursor.execute(insert_query, (
+                user_id,
+                customer.get("name", ""),
+                customer.get("email", ""),
+                customer.get("ride_count", 0),
+                customer.get("total_spent", 0.0),
+                customer.get("last_ride", None),
+                pickup_locations
+            ))
+        
+        connection.commit()
+        print("Data stored successfully in database")
+    except (Exception, Error) as error:
+        print(f"Error storing data in database: {error}")
+    finally:
+        if connection:
+            cursor.close()
+            connection.close()
+
+# Function to load data from database for analytics
+def load_data_for_analytics():
+    try:
+        connection = psycopg2.connect(**DB_CONFIG)
+        query = "SELECT * FROM customer_data;"
+        df = pd.read_sql_query(query, connection)
+        return df
+    except (Exception, Error) as error:
+        print(f"Error loading data from database: {error}")
+        return pd.DataFrame()
+    finally:
+        if connection:
+            connection.close()
+
+# Function to perform customer segmentation
+def segment_customers(df):
+    # Define segments based on ride_count and total_spent
+    df["segment"] = pd.cut(
+        df["ride_count"],
+        bins=[0, 5, 20, float("inf")],
+        labels=["Low Frequency", "Medium Frequency", "High Frequency"]
+    )
+    df["value_segment"] = pd.cut(
+        df["total_spent"],
+        bins=[0, 50, 200, float("inf")],
+        labels=["Low Value", "Medium Value", "High Value"]
+    )
+    return df
+
+# Function to calculate Customer Lifetime Value (CLV)
+def calculate_clv(df):
+    # Simple CLV: total_spent / ride_count * estimated_lifespan (e.g., 12 months)
+    df["avg_ride_value"] = df["total_spent"] / df["ride_count"].replace(0, 1)
+    df["clv"] = df["avg_ride_value"] * 12  # Assuming 12-month lifespan
+    return df
+
+# Function to analyze geographic patterns
+def analyze_geographic_patterns(df):
+    # Extract pickup locations (assuming JSONB with lat/lon)
+    pickup_data = []
+    for locs in df["pickup_locations"]:
+        loc_list = json.loads(locs) if locs else []
+        pickup_data.extend(loc_list)
+    
+    pickup_df = pd.DataFrame(pickup_data)
+    if not pickup_df.empty and "lat" in pickup_df and "lon" in pickup_df:
+        # Plot pickup locations
+        plt.figure(figsize=(10, 6))
+        plt.scatter(pickup_df["lon"], pickup_df["lat"], alpha=0.5, s=10)
+        plt.title("Customer Pickup Locations")
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.savefig(os.path.join(OUTPUT_DIR, "pickup_locations.png"))
+        plt.close()
+        print("Geographic plot saved as pickup_locations.png")
+    return pickup_df
+
+# Function to visualize ride trends
+def visualize_ride_trends(df):
+    df["last_ride"] = pd.to_datetime(df["last_ride"])
+    df["month"] = df["last_ride"].dt.to_period("M")
+    ride_counts = df.groupby("month").size()
+    
+    plt.figure(figsize=(12, 6))
+    ride_counts.plot(kind="line")
+    plt.title("Ride Frequency Over Time")
+    plt.xlabel("Month")
+    plt.ylabel("Number of Rides")
+    plt.savefig(os.path.join(OUTPUT_DIR, "ride_trends.png"))
+    plt.close()
+    print("Ride trends plot saved as ride_trends.png")
+
+# Function to generate marketing recommendations
+def generate_marketing_recommendations(df):
+    recommendations = []
+    
+    # Low-frequency users: Offer discounts
+    low_freq = df[df["segment"] == "Low Frequency"]
+    if not low_freq.empty:
+        recommendations.append(
+            f"Target {len(low_freq)} low-frequency users with a 20% discount on their next ride to boost engagement."
+        )
+    
+    # High-value users: Loyalty program
+    high_value = df[df["value_segment"] == "High Value"]
+    if not high_value.empty:
+        recommendations.append(
+            f"Enroll {len(high_value)} high-value users in a VIP loyalty program with exclusive perks."
+        )
+    
+    # Geographic targeting
+    pickup_df = analyze_geographic_patterns(df)
+    if not pickup_df.empty:
+        popular_zones = pickup_df.groupby(["lat", "lon"]).size().nlargest(3).index
+        recommendations.append(
+            "Launch location-based promotions in high-traffic pickup zones: " +
+            ", ".join([f"({lat:.2f}, {lon:.2f})" for lat, lon in popular_zones])
+        )
+    
+    return recommendations
+
+# Main execution
+def main():
+    # Step 1: Extract data
+    print("Extracting data from API...")
+    raw_data = extract_data_from_api()
+    
+    # Step 2: Store data
+    if raw_data:
+        print("Storing data in database...")
+        store_data_in_db(raw_data)
+    
+    # Step 3: Load data for analytics
+    df = load_data_for_analytics()
+    if df.empty:
+        print("No data available for analytics")
+        return
+    
+    # Step 4: Perform analytics
+    df = segment_customers(df)
+    df = calculate_clv(df)
+    
+    # Step 5: Visualize results
+    visualize_ride_trends(df)
+    analyze_geographic_patterns(df)
+    
+    # Step 6: Generate marketing recommendations
+    recommendations = generate_marketing_recommendations(df)
+    print("\nMarketing Recommendations:")
+    for rec in recommendations:
+        print(f"- {rec}")
+    
+    # Save analytics results
+    df.to_csv(os.path.join(OUTPUT_DIR, "customer_analytics.csv"), index=False)
+    print(f"Analytics results saved to {os.path.join(OUTPUT_DIR, 'customer_analytics.csv')}")
+
+if __name__ == "__main__":
+    main()
